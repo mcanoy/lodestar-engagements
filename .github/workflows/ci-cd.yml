@@ -33,7 +33,8 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-      run: mvn verify sonar:sonar -Dsonar.login=${{ secrets.SONAR_TOKEN }} -q
+        PROJECT_KEY: $ {{ secrets.SONAR_PROJECT_KEY }}
+      run: mvn -B verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar -Dsonar.projectKey=${PROJECT_KEY}
     - name: Clean sonar
       run: mvn clean
     - name: Find and Replace Commit
