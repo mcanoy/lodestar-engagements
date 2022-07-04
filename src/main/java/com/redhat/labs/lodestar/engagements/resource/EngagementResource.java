@@ -38,30 +38,46 @@ public class EngagementResource {
     EngagementService engagementService;
     
     @GET
-    public Response getEngagements(@BeanParam PageFilter pagingFilter, @QueryParam("region") Set<String> region) {
-        if(region.isEmpty()) { //no sorting yet
-            List<Engagement> engagements = engagementService.getEngagements(pagingFilter);
-            return Response.ok(engagements).header(TOTAL_HEADER, engagementService.countAll()).build();
-        }
+    public Response getEngagements(@BeanParam PageFilter pagingFilter, @QueryParam("region") Set<String> region,
+               @QueryParam("types") Set<String> types, @QueryParam("inStates") Set<EngagementState> states,
+               @QueryParam("q") String search, @QueryParam("category") String category) {
 
-        List<Engagement> engagements = engagementService.getEngagements(pagingFilter, region);
-        return Response.ok(engagements).header(TOTAL_HEADER, engagementService.countRegions(region)).build();
+        List<Engagement> engagements;
+        long total = 0;
+        if(search == null && category == null && region.isEmpty() && types.isEmpty() && states.isEmpty()) {
+            engagements = engagementService.getEngagements();
+            total = engagements.size();
+        } else {
+            engagements = engagementService.findEngagements(pagingFilter, search, category, region, types, states);
+            total = engagementService.countEngagements(search, category, region, types, states);
+        }
+        return Response.ok(engagements).header(TOTAL_HEADER, total).build(); //no paging yet
     }
+
     @GET
     @Path("inStates")
     public Response getEngagements(@QueryParam("inStates") Set<EngagementState> states) {
         if(states.isEmpty()) {
             return Response.status(Response.Status.BAD_REQUEST).entity(new ErrorMessage("State list is empty")).build();
         }
-        List<Engagement> engagements = engagementService.getEngagements(states);
+        List<Engagement> engagements = engagementService.findEngagements(new PageFilter(), null, null, Collections.emptySet(), Collections.emptySet(), states);
+        long total = engagementService.countEngagements(null, null, Collections.emptySet(), Collections.emptySet(), states);
+        return Response.ok(engagements).header(TOTAL_HEADER, total).build();
+    }
+
+    @GET
+    @Path("byUser/{email}")
+    public Response getEngagementsForUser(@PathParam("email") String email, @QueryParam("engagementUuids") Set<String> engagementUuids, @BeanParam PageFilter pagingFilter) {
+        List<Engagement> engagements = engagementService.getEngagementsForUser(pagingFilter, email, engagementUuids);
         return Response.ok(engagements).header(TOTAL_HEADER, engagements.size()).build();
     }
 
-    
     @GET
     @Path("category/{category}")
-    public Response getEngagementWithCategory(@PathParam("category") String category) {
-        List<Engagement> engagements = engagementService.getEngagementsWithCategory(category);
+    @Operation(summary = "Gets a list of engagements that have use the category input.")
+    public Response getEngagementWithCategory(@PathParam("category") String category, @BeanParam PageFilter pagingFilter,
+              @QueryParam("region") Set<String> region, @QueryParam("types") Set<String> types, @QueryParam("inStates") Set<EngagementState> states) {
+        List<Engagement> engagements = engagementService.getEngagementsWithCategory(category, pagingFilter, region, types, states);
         return Response.ok(engagements).header(TOTAL_HEADER, engagements.size()).build();
     }
     
@@ -107,8 +123,13 @@ public class EngagementResource {
         
         UriBuilder builder = uriInfo.getAbsolutePathBuilder();
         builder.path(engagement.getUuid());
-        
-        return Response.created(builder.build()).entity(engagement).build();
+
+        Optional<Engagement> persisted = engagementService.getEngagement(engagement.getUuid());
+        if(persisted.isPresent()) {
+            return Response.created(builder.build()).entity(persisted).build();
+        }
+
+        return Response.created(builder.build()).build();
     }
     
     @PUT
@@ -135,6 +156,28 @@ public class EngagementResource {
         return Response.ok(engagementService.getEngagement(uuid)).build();
     }
 
+    @GET
+    @Path("gitlab")
+    @Operation(summary = "Gets a list of engagements that are in the db but not gitlab")
+    public Set<String> getEngagementsNotInGitlab() {
+        return engagementService.getEngagementsNotInGitlab();
+    }
+
+    @PUT
+    @APIResponses(value = {
+            @APIResponse(responseCode = "404", description = "Engagement does not exist (by uuid)"),
+            @APIResponse(responseCode = "200", description = "Engagement sent to gitlab") })
+    @Operation(summary = "Retries the persist to gitlab. Message only applies to updates. Will ignore")
+    @Path("retry")
+    public Response retryGitlabPersistence(@QueryParam("uuid") String uuid, @DefaultValue("") @QueryParam("message") String message) {
+        Map<String, String> resp = engagementService.resendLastUpdateToGitlab(uuid, message);
+
+        if(resp.isEmpty()) {
+            return Response.ok().build();
+        }
+        return Response.status(Response.Status.NOT_FOUND).entity(resp).build();
+    }
+
     @PUT
     @Path("{uuid}/participants/{count}")
     public Response updateParticipants(@PathParam("uuid") String uuid, @PathParam("count") int count) {
@@ -152,9 +195,11 @@ public class EngagementResource {
     @PUT
     @Path("{uuid}/lastUpdate")
     public Response updateLastUpdate(@PathParam("uuid") String uuid) {
-        engagementService.updateLastUpdate(uuid);
+        String cleanUuid = uuid.replaceAll("[\n\r\t]", "_");
+        engagementService.updateLastUpdate(cleanUuid);
         return Response.ok().build();
     }
+
     
     @PUT
     @Path("refresh")
@@ -168,6 +213,13 @@ public class EngagementResource {
         }
 
         return Response.ok().header(TOTAL_HEADER, newCount).build();
+    }
+
+    @PUT
+    @Path("refresh/state")
+    public Response updateStatesInGitlab() {
+        engagementService.updateAllEngagementStates();
+        return Response.ok().build();
     }
     
     @GET
@@ -194,7 +246,7 @@ public class EngagementResource {
 
     @GET
     @Path("count")
-    public Response getCountByStatus(@QueryParam("time") String time) {
+    public Response getCountByStatus(@QueryParam("time") String time, @QueryParam("region") Set<String> regions) {
 
         Instant compare = Instant.now();
 
@@ -202,7 +254,7 @@ public class EngagementResource {
             compare = Instant.parse(time);
         }
 
-        return Response.ok(engagementService.getEngagementCountByStatus(compare)).build();
+        return Response.ok(engagementService.getEngagementCountByStatus(compare, regions, Collections.emptySet())).build();
     }
 
     @HEAD

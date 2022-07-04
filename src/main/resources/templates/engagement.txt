@@ -13,7 +13,7 @@
 {/if}{#if engagement.customerName != null }  "customer_name": "{engagement.customerName}",
 {/if}{#if engagement.description != null }  "description": "{engagement.description}",
 {/if}{#if engagement.endDate != null }  "end_date": "{engagement.endDate}",
-{/if}{#if engagement.engagementLeadEmail != null }  "engagement_lead_email": "{engagementLeadEmail}",
+{/if}{#if engagement.engagementLeadEmail != null }  "engagement_lead_email": "{engagement.engagementLeadEmail}",
 {/if}{#if engagement.engagementLeadName != null }  "engagement_lead_name": "{engagement.engagementLeadName}",
 {/if}  "engagement_region": "{engagement.region}",
   "engagement_type": "{engagement.type}",
@@ -24,9 +24,9 @@
 {/if}
 {#if engagement.launch != null}
   "launch": {
-    "launched_by": "{engagement.launchedBy}",
-    "launched_by_email": "{engagement.launchedByEmail}",
-    "launched_date_time": "{engagement.launchedDateTime}"
+    "launched_by": "{engagement.launch.launchedBy}",
+    "launched_by_email": "{engagement.launch.launchedByEmail}",
+    "launched_date_time": "{engagement.launch.launchedDateTime}"
   },
 {/if}  "project_id": {engagement.projectId},
   "project_name": "{engagement.name}",

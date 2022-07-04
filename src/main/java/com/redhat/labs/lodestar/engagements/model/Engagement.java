@@ -28,7 +28,7 @@ import lombok.NoArgsConstructor;
 @AllArgsConstructor
 @TypeName("Engagement")
 @EqualsAndHashCode
-@JsonIgnoreProperties(value = { "id" })
+@JsonIgnoreProperties(value = { "id", "gitlabRetry" })
 @JsonPropertyOrder(alphabetic = true)
 public class Engagement {
 
@@ -78,6 +78,10 @@ public class Engagement {
     private Instant endDate;
     private Instant createdDate;
     private Instant lastUpdate;
+
+    private EngagementState currentState;
+
+    private boolean gitlabRetry;
 
     @Builder.Default
     private Integer participantCount = 0;
@@ -139,7 +143,7 @@ public class Engagement {
             projectId = stone.getProjectId();
         }
         
-        if(stone.getLaunch() != null) { //Launch has already happened
+        if(stone.getLaunch() != null && launch != null) { //Launch has already happened - you can delete but not change the launch info
             launch = stone.getLaunch();
         }
 

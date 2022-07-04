@@ -1,15 +1,14 @@
 package com.redhat.labs.lodestar.engagements.service;
 
-import java.util.Collections;
-import java.util.List;
-import java.util.Optional;
-import java.util.Set;
+import java.util.*;
 
+import javax.annotation.PostConstruct;
 import javax.enterprise.context.ApplicationScoped;
 import javax.inject.Inject;
 
+import com.google.gson.*;
+import com.redhat.labs.lodestar.engagements.model.EngagementState;
 import com.redhat.labs.lodestar.engagements.utils.JsonMarshaller;
-import io.quarkus.qute.Template;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.gitlab4j.api.models.Group;
 import org.gitlab4j.api.models.Project;
@@ -40,13 +39,29 @@ public class GitlabService {
     @Inject
     JsonMarshaller json;
 
-    // Template to retrofit the data back to v1 for orchestration
-    // Burn after upgrade
-    @Inject
-    Template engagement;
-
     @ConfigProperty(name = "disable.refresh.bus")
     boolean disableBus;
+
+    @ConfigProperty(name = "lodestar.tag")
+    String lodestarTag;
+
+    @ConfigProperty(name = "lodestar.tag.format")
+    String lodestarTagFormat;
+
+    Gson gson = new GsonBuilder().setPrettyPrinting().create();
+
+    List<String> statusPossibilities;
+
+    @PostConstruct
+    void setPossibleStatuses() {
+        statusPossibilities = new ArrayList<>();
+
+        for(EngagementState state : EngagementState.values()) {
+            statusPossibilities.add(String.format(lodestarTagFormat, state));
+        }
+
+        LOGGER.debug("states {}", statusPossibilities);
+    }
     
     /**
      * Creates:
@@ -70,16 +85,29 @@ public class GitlabService {
         Project project = gitlabApiClient.createProject(engagement.getUuid(), engagementGroup.getId());
         engagement.setProjectId(project.getId());
 
+        //Placing before commit so that the webhook will fire on commit
         gitlabApiClient.createWebhooks(engagement.getProjectId(), engagement.getState());
         gitlabApiClient.activateDeployKey(engagement.getProjectId());
 
-        String legacy = this.createLegacyJson(engagement);
-
-        gitlabApiClient.createEngagementFiles(engagement, legacy);
-        
+        LOGGER.debug("hooks created");
+        createEngagementFilesInGitlab(engagement);
         engagementService.update(engagement, false);
 
         LOGGER.debug("creation complete {}", engagement);
+    }
+
+    /**
+     * Only used when a failure occurred and the project was created but the files were not.
+     * @param engagement
+     */
+    @ConsumeEvent(value = EngagementService.CREATE_ENGAGEMENT_FILES, blocking = true)
+    public void createEngagementFiles(Engagement engagement) {
+        createEngagementFilesInGitlab(engagement);
+    }
+
+    private void createEngagementFilesInGitlab(Engagement engagement) {
+        String legacy = this.createLegacyJson(engagement);
+        gitlabApiClient.createEngagementFiles(engagement, legacy);
     }
     
     /**
@@ -91,7 +119,7 @@ public class GitlabService {
      */
     @ConsumeEvent(value = EngagementService.UPDATE_ENGAGEMENT, blocking = true)
     public void updateEngagementInGitlab(Engagement engagement) {
-        LOGGER.debug("Gitlabbing engagement update - {}", engagement);
+        LOGGER.debug("Gitlab engagement update - {}", engagement);
 
         Optional<Project> existingOption = gitlabApiClient.getProject(engagement.getProjectId());
 
@@ -111,9 +139,7 @@ public class GitlabService {
             LOGGER.debug("path did not change");
         }
 
-        List<Category> categories = categoryService.getCategories(engagement.getUuid());
-        String legacy = updateLegacyJson(engagement, null, null, null, categories);
-
+        String legacy = updateLegacyJson(engagement);
         gitlabApiClient.updateEngagementFile(engagement, legacy);
         engagementService.update(engagement, false);
 
@@ -158,6 +184,42 @@ public class GitlabService {
         LOGGER.debug("{}", message);
         List<Engagement> engagements = engagementService.getEngagements();
         engagements.forEach(this::updateWebhook);
+    }
+
+    @ConsumeEvent(value = EngagementService.UPDATE_STATUS, blocking = true)
+    public void updateStatus(Engagement engagement) {
+        Optional<Project> p = gitlabApiClient.getProject(engagement.getProjectId());
+        if(p.isPresent()) {
+            List<String> tags = p.get().getTagList();
+            tags.removeAll(statusPossibilities);
+
+            String stateTag = String.format(lodestarTagFormat, engagement.getCurrentState());
+            tags.add(stateTag);
+
+            gitlabApiClient.updateProject(p.get());
+        }
+    }
+
+    /**
+     * Fetches project data from gitlab
+     * @param projectId the gitlab project id
+     * @return true if project data is found otherwise false
+     */
+    public boolean doesProjectExist(int projectId) {
+        if(projectId < 2) {
+            return false;
+        }
+        Optional<Project> p = gitlabApiClient.getProject(projectId);
+        return p.isPresent();
+    }
+
+    /**
+     * Fetches engagement/engagement.json from gitlab
+     * @param projectId the gitlab project id
+     * @return true if the engagement.json is present otherwise false
+     */
+    public boolean doesEngagementJsonExist(int projectId) {
+        return gitlabApiClient.getEngagement(projectId).isPresent();
     }
 
     public void refreshCategories() {
@@ -210,8 +272,7 @@ public class GitlabService {
         if(currentCustomerGroupOption.isEmpty()) {
             throw new EngagementException(String.format("Current customer group was not found %s", currentPath));
         }
-        
-        Group engagementCurrentGroup = currentEngagementGroupOption.get();
+
         Group customerCurrentGroup = currentCustomerGroupOption.get();
         
         boolean customerChanged = !customerCurrentGroup.getName().equals(engagement.getName()) && 
@@ -258,15 +319,55 @@ public class GitlabService {
     }
     
     private String createLegacyJson(Engagement e) {
-        return updateLegacyJson(e, null, null, null, Collections.emptyList());
+        return getLegacyJson(e, new JsonObject());
     }
 
-    private String updateLegacyJson(Engagement e, String artifacts, String participants, String hosting, List<Category> categoryList) {
-        String categories = json.toJson(categoryList);
-        String useCases = json.toJson(e.getUseCases());
+    private String updateLegacyJson(Engagement e) {
+        String legacy = gitlabApiClient.getLegacyEngagement(e.getProjectId());
 
-        return engagement.data("engagement", e).data("artifacts", artifacts).data("participants", participants)
-                .data("hosting", hosting).data("useCases", useCases).data("categories", categories).render();
+        JsonElement legacyElement = gson.fromJson(legacy, JsonElement.class);
+        JsonObject legacyJsonObject = legacyElement.getAsJsonObject();
+        return getLegacyJson(e, legacyJsonObject);
+    }
+
+    String getLegacyJson(Engagement e, JsonObject legacyJsonObject) {
+
+        String v2 = json.toJson(e);
+        JsonElement v2element = gson.fromJson(v2, JsonElement.class);
+        JsonObject v2FullObject = v2element.getAsJsonObject();
+
+        addElement("hosting_environments", legacyJsonObject, v2FullObject );
+        addElement("engagement_users", legacyJsonObject, v2FullObject );
+        addElement("artifacts", legacyJsonObject, v2FullObject );
+        renameElement("type", "engagement_type", v2FullObject);
+        renameElement("region", "engagement_region", v2FullObject);
+        renameElement("name", "project_name", v2FullObject);
+        v2FullObject.remove("participant_count");
+        v2FullObject.remove("hosting_count");
+        v2FullObject.remove("artifact_count");
+        v2FullObject.remove("last_message");
+
+        //sort for readability on commit
+        JsonObject sorted = new JsonObject();
+        v2FullObject.entrySet().stream().sorted(Map.Entry.comparingByKey()).forEach(es -> sorted.add(es.getKey(), es.getValue()));
+
+        LOGGER.debug("render {}", gson.toJson(sorted));
+
+        return gson.toJson(sorted);
+    }
+
+    void addElement(String elementName, JsonObject existing, JsonObject newValues) {
+        //GET
+        JsonElement hostingElement = existing.get(elementName);
+        //ADD
+        newValues.add(elementName, hostingElement);
+    }
+
+    void renameElement(String elementName, String newElementName, JsonObject newValues) {
+        //GET
+        JsonElement hostingElement = newValues.get(elementName);
+        //ADD
+        newValues.add(newElementName, hostingElement);
     }
 
 }

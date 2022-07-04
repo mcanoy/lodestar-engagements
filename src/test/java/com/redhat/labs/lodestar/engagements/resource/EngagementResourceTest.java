@@ -9,6 +9,7 @@ import static org.mockito.Mockito.verify;
 import javax.inject.Inject;
 import javax.ws.rs.core.Response.Status;
 
+import com.redhat.labs.lodestar.engagements.model.EngagementState;
 import com.redhat.labs.lodestar.engagements.model.UseCase;
 import com.redhat.labs.lodestar.engagements.service.GitlabService;
 import io.quarkus.test.junit.mockito.InjectSpy;
@@ -29,12 +30,14 @@ import org.mockito.Mockito;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.List;
 import java.util.Optional;
 
 @QuarkusTest
 @TestHTTPEndpoint(EngagementResource.class)
 @QuarkusTestResource(ExternalApiWireMock.class)
 class EngagementResourceTest {
+
     private static final String AUTHOR = "Mitch";
     private static final String AUTHOR_EMAIL = "mitch@bucannon.com";
 
@@ -98,11 +101,39 @@ class EngagementResourceTest {
     }
 
     @Test
+    void testGetEngagementsForTypeRegionAndState() {
+        engagementService.create(Engagement.builder().name("unit test").customerName("blue hat").region("latam").type("Residency").currentState(EngagementState.UPCOMING).build());
+
+        given().queryParam("inStates", EngagementState.UPCOMING)
+                .queryParam("region", "na")
+                .queryParam("type", "Residency")
+                .when().get()
+                .then().statusCode(200).body("size()", equalTo(2))
+                .body("[0].region", equalTo("na"))
+                .body("[0].type", equalTo("do500"));
+
+        given().queryParam("inStates", EngagementState.UPCOMING)
+                .queryParam("region", "latam")
+                .queryParam("type", "DO500")
+                .when().get()
+                .then().statusCode(200).body("size()", equalTo(1))
+                .body("[0].region", equalTo("latam"))
+                .body("[0].type", equalTo("Residency"));
+
+        given().queryParam("inStates", EngagementState.UPCOMING)
+                .when().get()
+                .then().statusCode(200).body("size()", equalTo(3))
+                .body("[0].state", equalTo("UPCOMING"))
+                .body("[1].state", equalTo("UPCOMING"))
+                .body("[2].state", equalTo("UPCOMING"));
+    }
+
+    @Test
     void testGetPagedEngagements() {
         int page = 0;
-        int pageSize = 1;
+        int pageSize = 2;
         given().queryParam("page", page).queryParam("pageSize", pageSize)
-                .when().get().then().statusCode(200).header("x-total-engagements", equalTo("2")).body("size()", equalTo(1));
+                .when().get().then().statusCode(200).header("x-total-engagements", equalTo("2")).body("size()", equalTo(2));
     }
 
     @Test
@@ -114,6 +145,19 @@ class EngagementResourceTest {
                 .when().get().then().statusCode(200).header("x-total-engagements", equalTo("2")).body("size()", equalTo(1));
 
         given().queryParam("page", page).queryParam("pageSize", pageSize).queryParam("region", "latam")
+                .queryParam("sort", "name")
+                .when().get().then().statusCode(200).header("x-total-engagements", equalTo("0")).body("size()", equalTo(0));
+    }
+
+    @Test
+    void testGetPagedEngagementsForType() {
+        int page = 0;
+        int pageSize = 1;
+        given().queryParam("page", page).queryParam("pageSize", pageSize).queryParam("types", "do500")
+                .queryParam("sort", "name|DESC")
+                .when().get().then().statusCode(200).header("x-total-engagements", equalTo("2")).body("size()", equalTo(1));
+
+        given().queryParam("page", page).queryParam("pageSize", pageSize).queryParam("types", "OpenLeadership")
                 .queryParam("sort", "name")
                 .when().get().then().statusCode(200).header("x-total-engagements", equalTo("0")).body("size()", equalTo(0));
     }
@@ -187,7 +231,7 @@ class EngagementResourceTest {
                 .startDate(startDate).endDate(endDate).archiveDate(archiveDate).launch(launch).build();
         engagementService.create(engagement);
 
-        engagement = Engagement.builder().name("DO503").customerName("Fish Gym").region("na").type("Residency")
+        engagement = Engagement.builder().name("DO503").customerName("Fish Gym").region("emea").type("Residency")
                 .startDate(startDate).endDate(endDate).launch(launch).build();
         engagementService.create(engagement);
 
@@ -202,6 +246,28 @@ class EngagementResourceTest {
                 .body("UPCOMING", equalTo(2))
                 .body("ACTIVE", equalTo(4))
                 .body("ANY", equalTo(6));
+
+        given().queryParam("time", Instant.EPOCH.toString()).queryParam("region", "na").when().get("count").then().statusCode(200)
+                .body("UPCOMING", equalTo(2))
+                .body("ACTIVE", equalTo(3))
+                .body("ANY", equalTo(5));
+
+    }
+
+    @Test
+    void testGetEngagementByUser() {
+        String email = "Calem@calm.com";
+        given().pathParam("email", email).when().get("byUser/{email}")
+                        .then().body("size()", equalTo(0));
+
+        List<Engagement> engagements = engagementService.getEngagements();
+        engagements.forEach(e-> {
+            e.setEngagementLeadEmail(email);
+            engagementService.update(e, false);
+        });
+
+        given().pathParam("email", email).when().get("byUser/{email}")
+                .then().body("size()", equalTo(2));
 
     }
 
@@ -257,9 +323,14 @@ class EngagementResourceTest {
 
     @Test
     void testCreateEngagementBadRequest() {
-        Engagement engagement = Engagement.builder().customerName("").region("na").type("Residency").build();
+        Engagement engagement = Engagement.builder().customerName("ab!!!").name("abcd").region("na").type("Residency").build();
         String e = new JsonMarshaller().toJson(engagement);
-        given().contentType(ContentType.JSON).when().body(e).post().then().statusCode(Status.BAD_REQUEST.getStatusCode()).header("Location", nullValue());
+        given().contentType(ContentType.JSON)
+                .when().body(e).post()
+                .then().statusCode(Status.BAD_REQUEST.getStatusCode())
+                    .header("Location", nullValue())
+                    .body("parameter_violations.size()", equalTo(1))
+                    .body("parameter_violations[0].value", equalTo("ab!!!"));
     }
 
     @Test
@@ -382,6 +453,12 @@ class EngagementResourceTest {
     void testLaunchAlreadySuccess() {
         String uuid = "uuid1";
 
+        Optional<Engagement> launchedOption = engagementService.getEngagement("uuid1");
+        assertTrue(launchedOption.isPresent());
+        Engagement notLaunched = launchedOption.get();
+        assertEquals(EngagementState.UPCOMING, notLaunched.getState());
+        assertEquals(EngagementState.UPCOMING, notLaunched.getCurrentState());
+
         given().pathParam("uuid", uuid).queryParam("author", AUTHOR)
                 .queryParam("authorEmail", AUTHOR_EMAIL)
                 .contentType(ContentType.JSON)
@@ -390,6 +467,48 @@ class EngagementResourceTest {
         .then().statusCode(200);
 
         verify(gitlabService, timeout(1000).times(1)) .updateEngagementInGitlab(Mockito.any(Engagement.class));
+
+        launchedOption = engagementService.getEngagement("uuid1");
+        assertTrue(launchedOption.isPresent());
+        Engagement launched = launchedOption.get();
+        assertEquals(EngagementState.PAST, launched.getState());
+        assertEquals(EngagementState.PAST, launched.getCurrentState());
+    }
+
+    @Test
+    void testLaunchUpcomingToActive() {
+        Engagement e = Engagement.builder().customerName("fragment").name("rock").region("dev").type("DO500").build();
+        engagementService.create(e);
+
+        e.setStartDate(Instant.now().minus(7, ChronoUnit.DAYS));
+        e.setEndDate(Instant.now().plus(7, ChronoUnit.DAYS));
+        e.setEngagementLeadEmail("a@b.com");
+        e.setEngagementLeadName("A B");
+        e.setTechnicalLeadEmail("c@d.com");
+        e.setTechnicalLeadName("C D");
+        e.setCustomerContactName("E F");
+        e.setCustomerContactEmail("e@f.com");
+        e.setArchiveDate(Instant.now().plus(14, ChronoUnit.DAYS));
+
+        engagementService.update(e);
+
+        assertEquals(EngagementState.UPCOMING, e.getState());
+        assertEquals(EngagementState.UPCOMING, e.getCurrentState());
+
+        given().pathParam("uuid", e.getUuid()).queryParam("author", AUTHOR)
+                .queryParam("authorEmail", AUTHOR_EMAIL)
+                .contentType(ContentType.JSON)
+                .when()
+                .put("{uuid}/launch")
+                .then().statusCode(200);
+
+        verify(gitlabService, timeout(1000).times(2)) .updateEngagementInGitlab(Mockito.any(Engagement.class));
+
+        Optional<Engagement> launchedOption = engagementService.getEngagement(e.getUuid());
+        assertTrue(launchedOption.isPresent());
+        Engagement launched = launchedOption.get();
+        assertEquals(EngagementState.ACTIVE, launched.getState());
+        assertEquals(EngagementState.ACTIVE, launched.getCurrentState());
     }
 
     @Test
@@ -415,7 +534,50 @@ class EngagementResourceTest {
 
     @Test
     void testGetWithCategory() {
-        given().pathParam("category", "philanthropy").when().get("category/{category}")
-                .then().statusCode(200).body("size", equalTo(2)).header("x-total-engagements", equalTo("2"));
+        List<Engagement> e = engagementService.getEngagements();
+        given().pathParam("category", "philanthropy").queryParam("sort", "name|desc,customerName").when().get("category/{category}")
+                .then().statusCode(200).body("size()", equalTo(2)).header("x-total-engagements", equalTo("2"));
+    }
+
+    @Test
+    void testUpdateStates() {
+        given().when().put("refresh/state").then().statusCode(200);
+    }
+
+    @Test
+    void testMissingGitlabProjects() {
+        Engagement engagement = Engagement.builder().name("DO500").customerName("Catfish Gym").region("na").projectId(20).build();
+        engagementService.create(engagement);
+        given().when().get("gitlab").then().statusCode(200).body("size()", equalTo(2))
+                .body("[0]", equalTo("Engagement Banana Hut banana uuid1"))
+                .body("[1]", equalTo("Engagement Banana Hut2 banana2 uuid2"));
+    }
+
+    @Test
+    void testRetryToGitlabInGitlabUpdate() {
+        //Update engagement files
+        Engagement engagement = Engagement.builder().name("DO500").customerName("Catfish Gym").region("na").projectId(20).build();
+        engagementService.create(engagement);
+
+        given().queryParam("uuid", engagement.getUuid()).when().put("retry").then().statusCode(200);
+    }
+
+    @Test
+    void testRetryToGitlabInGitlabCreate() {
+        //Create engagement riles
+        Engagement engagement = Engagement.builder().name("DO500").customerName("Catfish Gym").region("na").projectId(15).build();
+        engagementService.create(engagement);
+
+        given().queryParam("message", "mess").queryParam("uuid", engagement.getUuid()).when().put("retry").then().statusCode(200);
+    }
+
+    @Test
+    void testRetryToGitlabNotInGitlab() {
+        given().queryParam("uuid", "uuid1").when().put("retry").then().statusCode(200);
+    }
+
+    @Test
+    void testRetryToGitlabNotFound() {
+        given().queryParam("uuid", "uuidxxx").when().put("retry").then().statusCode(404).body("message", equalTo("Engagement not found for uuid uuidxxx"));
     }
 }

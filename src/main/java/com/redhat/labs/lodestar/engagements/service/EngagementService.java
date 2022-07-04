@@ -12,6 +12,7 @@ import javax.ws.rs.core.Response;
 import javax.ws.rs.core.Response.Status;
 
 import com.redhat.labs.lodestar.engagements.model.*;
+import io.quarkus.scheduler.Scheduled;
 import org.apache.http.HttpStatus;
 import org.javers.core.Javers;
 import org.javers.core.JaversBuilder;
@@ -34,6 +35,8 @@ public class EngagementService {
     public static final String UPDATE_ENGAGEMENT = "update.engagement.event";
     public static final String CREATE_ENGAGEMENT = "create.engagement.event";
     public static final String DELETE_ENGAGEMENT = "delete.engagement.event";
+    public static final String UPDATE_STATUS = "update.status.engagement.event";
+    public static final String CREATE_ENGAGEMENT_FILES = "create.engagement.file.event";
     public static final String LAUNCH_MESSAGE = "\uD83D\uDEA2 \uD83C\uDFF4\u200D☠️ \uD83D\uDE80";
     
     @Inject
@@ -62,10 +65,57 @@ public class EngagementService {
     @PostConstruct
     public void setupJavers() {
         List<String> ignoredProps = Arrays.asList("id", "createdDate", "creationDetails", "lastMessage", "lastUpdateByEmail", "lastUpdateByName",
-                "lastUpdate", "projectId");
+                "lastUpdate", "projectId", "currentState");
 
         javers = JaversBuilder.javers().withListCompareAlgorithm(ListCompareAlgorithm.LEVENSHTEIN_DISTANCE)
                 .registerEntity(new EntityDefinition(Engagement.class, "uuid", ignoredProps)).build();
+    }
+
+    @Scheduled(every="5m")
+    void checkDB() {
+        long count = engagementRepository.count();
+
+        if(count == 0) {
+            LOGGER.info("No engagements found. Initiating refresh");
+            refresh();
+        }
+    }
+
+    @Scheduled(cron = "{cron.status}")
+    void updateStatusTimer() {
+        LOGGER.debug("Updating states");
+        List<Engagement> changedEngagements = new ArrayList<>();
+        engagementRepository.findAll().stream().forEach(e -> {
+            if(e.getCurrentState() == null || e.getCurrentState() != e.getState()) {
+                e.setCurrentState(e.getState());
+                changedEngagements.add(e);
+                bus.publish(UPDATE_STATUS, e);
+            }
+        });
+
+        if(!changedEngagements.isEmpty()) {
+            LOGGER.debug("Updating {} states ", changedEngagements.size());
+            engagementRepository.update(changedEngagements);
+        }
+    }
+
+    @Scheduled(every = "5m", delayed = "1m")
+    void checkLastUpdate() {
+        List<Engagement> noUpdated = engagementRepository.findEngagementsWithoutLastUpdate();
+        if(!noUpdated.isEmpty()) {
+            LOGGER.info("Attempting update of last activity for {} engagements", noUpdated.size());
+            activityService.getLastActivityPerEngagement(noUpdated);
+            engagementRepository.update(noUpdated);
+            LOGGER.info("Last updated check completed with {} changes", noUpdated.size());
+        }
+    }
+
+    public void updateAllEngagementStates() {
+        LOGGER.debug("Updating all states in gitlab");
+        engagementRepository.findAll().stream().forEach(e -> {
+                e.setCurrentState(e.getState());
+                bus.publish(UPDATE_STATUS, e);
+        });
     }
 
     public void create(Engagement engagement) {
@@ -82,8 +132,59 @@ public class EngagementService {
         engagement.updateTimestamps();
         engagement.setCreator();
         engagementRepository.persist(engagement);
-       
+
         bus.publish(CREATE_ENGAGEMENT, engagement);
+    }
+
+    /**
+     *
+     * @return A list of uuids that do not exist in gitlab
+     */
+    public Set<String> getEngagementsNotInGitlab() {
+        String message = "Engagement %s %s %s";
+        Set<String> missing = new TreeSet<>();
+        getEngagements().parallelStream().forEach(e -> {
+            if(!gitlabService.doesProjectExist(e.getProjectId())) {
+                missing.add(String.format(message, e.getCustomerName(), e.getName(), e.getUuid()));
+            }
+        });
+
+        return missing;
+    }
+
+    /**
+     * Re-fires a commit without commit info :(
+     * @param uuid
+     * @param message A message to add to the commit since it be recreated
+     * @return
+     */
+    public Map<String, String> resendLastUpdateToGitlab(String uuid, String message) {
+        LOGGER.debug("Retry update {}", uuid);
+        String messageKey = "message";
+        String messageValue = "%s not found for uuid %s";
+        Optional<Engagement> option = getEngagement(uuid);
+        if(option.isEmpty()) {
+            return  Map.of(messageKey, String.format(messageValue, "Engagement", uuid));
+        }
+
+        Engagement engagement = option.get();
+        engagement.setGitlabRetry(true);
+        LOGGER.debug("last message ({}): {}", engagement.getUuid(), engagement.getLastMessage());
+
+        if(gitlabService.doesProjectExist(engagement.getProjectId())) {
+            String lastMessage = engagement.getLastMessage() == null ? message : String.format("%s. %n%s", message, engagement.getLastMessage());
+            engagement.setLastMessage(lastMessage);
+
+            if(gitlabService.doesEngagementJsonExist(engagement.getProjectId())) {
+                bus.publish(UPDATE_ENGAGEMENT, engagement);
+            } else {
+                bus.publish(CREATE_ENGAGEMENT_FILES, engagement);
+            }
+        } else {
+            bus.publish(CREATE_ENGAGEMENT, engagement);
+        }
+
+        return Collections.emptyMap();
     }
 
     public void launch(String uuid, String author, String authorEmail) {
@@ -101,10 +202,13 @@ public class EngagementService {
         engagement.setLaunch(Launch.builder().launchedBy(author).launchedByEmail(authorEmail)
                 .launchedDateTime(Instant.now()).build());
 
+        LOGGER.debug("Launch ahoy {} -- {}", engagement.getUuid(), engagement.getState());
+        engagement.setCurrentState(engagement.getState());
         engagementRepository.update(engagement);
         engagement.setLastMessage(LAUNCH_MESSAGE);
 
         bus.publish(UPDATE_ENGAGEMENT, engagement);
+        bus.publish(UPDATE_STATUS, engagement);
     }
 
     public void updateCount(String uuid, int count, String column) {
@@ -112,6 +216,7 @@ public class EngagementService {
     }
 
     public void updateLastUpdate(String uuid) {
+        LOGGER.debug("last update for {}", uuid);
         engagementRepository.updateLastUpdate(uuid, Instant.now());
     }
     
@@ -124,28 +229,39 @@ public class EngagementService {
     }
     
     public boolean update(Engagement engagement, boolean updateGitlab, boolean categoryUpdate) {
+        LOGGER.debug("updating e {} up git {} up cat {}", engagement.getUuid(), updateGitlab, categoryUpdate);
+
         boolean updated = false;
 
         Optional<Engagement> option = engagementRepository.getEngagement(engagement.getUuid());
 
         Engagement existing = option.orElseThrow(
-                () -> new WebApplicationException("no engagement found, use POST to create", HttpStatus.SC_NOT_FOUND));
+                () -> new WebApplicationException(String.format("no engagement found for uuid %s, use POST to create", engagement.getUuid()), HttpStatus.SC_NOT_FOUND));
 
         if (engagementRepository.isNameTaken(engagement.getUuid(), engagement.getCustomerName(), engagement.getName())) { // Checking customer + engagement name match
             throw new WebApplicationException("This engagement name is in use by another uuid", Status.CONFLICT);
         }
 
-        engagement.updateTimestamps();
+        if(updateGitlab) {
+            engagement.updateTimestamps();
+        }
+
         boolean initialFieldUpdated = engagement.overrideImmutableFields(existing, categoryUpdate);
 
         updateUseCases(engagement, existing);
 
         Diff diff = javers.compare(existing, engagement);
 
-        LOGGER.debug("diff {}", diff);
+        LOGGER.debug("diff {} ==> {}", diff.hasChanges(), diff);
 
         if (diff.hasChanges() || initialFieldUpdated) {
             updated = true;
+
+            if(engagement.getCurrentState() != engagement.getState()) {
+                engagement.setCurrentState(engagement.getState());
+                bus.publish(UPDATE_STATUS, engagement);
+            }
+
             engagementRepository.update(engagement);
 
             if (updateGitlab) {
@@ -176,9 +292,12 @@ public class EngagementService {
         bus.publish(DELETE_ENGAGEMENT, engagement);
     }
 
-    public Map<EngagementState, Integer> getEngagementCountByStatus(Instant currentTime) {
+    public Map<EngagementState, Integer> getEngagementCountByStatus(Instant currentTime, Set<String> regions, Set<String> types) {
 
-        List<Engagement> engagementList = getEngagements();
+
+        List<Engagement> engagementList = regions.isEmpty() ? getEngagements() :
+            getEngagements(PageFilter.builder().page(0).pageSize(1000).build(), regions, types, Collections.emptySet());
+
         Map<EngagementState, Integer> statusCounts = new EnumMap<>(EngagementState.class);
 
         for (Engagement engagement : engagementList) {
@@ -201,24 +320,55 @@ public class EngagementService {
         return engagementRepository.getEngagements(pageFilter);
     }
 
-    public List<Engagement> getEngagements(PageFilter pageFilter, Set<String> regions) {
-        return engagementRepository.getEngagements(pageFilter, regions);
+    public List<Engagement> getEngagements(PageFilter pageFilter, Set<String> regions, Set<String> types, Set<EngagementState> inStates) {
+        List<Engagement> engagements = engagementRepository.getEngagements(pageFilter, regions, types);
+        if(inStates.isEmpty()) {
+            return engagements;
+        }
+
+        return filterEngagementsByState(engagements, inStates);
+
+    }
+
+    public List<Engagement> getEngagementsForUser(PageFilter pageFilter, String userEmail, Set<String> engagementUuids) {
+        return engagementRepository.getEngagementsByUser(pageFilter, userEmail, engagementUuids);
+    }
+
+    public long countEngagements(String input, String category, Set<String> regions, Set<String> types, Set<EngagementState> states) {
+        return engagementRepository.countEngagements(input, category, regions, types, states);
+    }
+
+    public List<Engagement> findEngagements(PageFilter pageFilter, String input, String category, Set<String> regions, Set<String> types, Set<EngagementState> states) {
+        return engagementRepository.findEngagements(pageFilter, input, category, regions, types, states);
+    }
+
+    public List<Engagement> filterEngagementsByState(List<Engagement> engagements, Set<EngagementState> states) {
+        return engagements.stream().filter(e -> states.contains(e.getState())).collect(Collectors.toList());
     }
 
     public List<Engagement> getEngagements(Set<EngagementState> states) {
-        return getEngagements().stream().filter(e -> states.contains(e.getState())).collect(Collectors.toList());
+        return getEngagements();
     }
 
     public long countAll() {
         return engagementRepository.count();
     }
 
-    public long countRegions(Set<String> regions) {
-        return engagementRepository.countEngagements(regions);
+    public long count(Set<String> regions, Set<String> types, Set<EngagementState> inStates) {
+        return engagementRepository.countEngagements(regions, types, inStates);
+    }
+
+    public long countRegions(Set<String> regions, Set<String> types) {
+        return engagementRepository.countEngagements(regions, types, Collections.emptySet());
     }
     
-    public List<Engagement> getEngagementsWithCategory(String category) {
-        return engagementRepository.getEngagementsWithCategory(category);
+    public List<Engagement> getEngagementsWithCategory(String category, PageFilter pageFilter, Set<String> regions, Set<String> types, Set<EngagementState> inStates) {
+        List<Engagement> engagements = engagementRepository.getEngagementsWithCategory(category, pageFilter, regions, types);
+        if(inStates.isEmpty()) {
+            return engagements;
+        }
+
+        return filterEngagementsByState(engagements, inStates);
     }
 
 
@@ -267,6 +417,7 @@ public class EngagementService {
     public long refresh() {
         LOGGER.debug("Refresh");
         List<Engagement> engagements = gitlabService.getEngagements();
+        engagements.forEach(e -> e.setCurrentState(e.getState()));
         participantService.addEngagementCount(engagements);
         artifactService.addEngagementCount(engagements);
         activityService.getLastActivityPerEngagement(engagements);

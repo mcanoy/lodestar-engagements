@@ -17,7 +17,6 @@ import org.gitlab4j.api.models.Commit;
 import org.gitlab4j.api.models.CommitAction;
 import org.gitlab4j.api.models.CommitAction.Action;
 import org.gitlab4j.api.models.CommitPayload;
-import org.gitlab4j.api.models.DeployKey;
 import org.gitlab4j.api.models.Group;
 import org.gitlab4j.api.models.GroupParams;
 import org.gitlab4j.api.models.GroupProjectsFilter;
@@ -42,9 +41,16 @@ public class GitlabApiClient {
     private static final String PROJECT_NAME = "iac";
     private static final String LAUNCHED_MESSAGE = "Launch Ahoy!";
     private static final String SUMMARY_MESSAGE = "Summary Update";
+    private static final String RETRY_MESSAGE = "RE-POST: ";
+    private static final String DEPLOYMENT_KEY_PREFIX = "LodeStar";
+    private static final String DEPLOYMENT_KEY_POSTFIX = "DK";
+    private static final String ENGAGEMENT_JSON = "engagement.json";
     
     @ConfigProperty(name = "file.engagement")
     String engagementFile;
+
+    @ConfigProperty(name = "file.runtime")
+    String runtimeInfoFile;
     
     @ConfigProperty(name = "file.category")
     String categoryFile;
@@ -69,6 +75,12 @@ public class GitlabApiClient {
     
     @ConfigProperty(name = "gitlab.dir")
     String dataDir;
+
+    @ConfigProperty(name = "lodestar.tag")
+    String lodestarTag;
+
+    @ConfigProperty(name = "lodestar.tag.format")
+    String lodestarTagFormat;
     
     @ConfigProperty(name = "seed.file.list")
     List<String> seedFileList;
@@ -88,20 +100,25 @@ public class GitlabApiClient {
     
     @PostConstruct
     void setupGitlabClient() {
+        //Config is adding a line feed char
+        gitUrl = gitUrl.trim();
+        pat = pat.trim();
+
+        LOGGER.info("Base url {}", gitUrl);
+
         gitlabApi = new GitLabApi(gitUrl, pat);
         gitlabApi.enableRequestResponseLogging();
         
         Group headGroup;
         try {
             headGroup = gitlabApi.getGroupApi().getGroup(engagementRepositoryId);
-        
-        
-        if(headGroup == null) {
-            LOGGER.warn("Could not find the path for repo {}", engagementRepositoryId);
-        } else {
-            engagementPathPrefix = headGroup.getFullPath();
-            LOGGER.info("Engagement repo set to {}", engagementPathPrefix);
-        }
+
+            if(headGroup == null) {
+                LOGGER.warn("Could not find the path for repo {}", engagementRepositoryId);
+            } else {
+                engagementPathPrefix = headGroup.getFullPath();
+                LOGGER.info("Engagement repo set to {}", engagementPathPrefix);
+            }
         } catch (GitLabApiException e) {
             LOGGER.error("Gitlab api is not working", e);
         }
@@ -172,6 +189,19 @@ public class GitlabApiClient {
         }
     }
 
+    public String getLegacyEngagement(Integer projectId) {
+        try {
+            RepositoryFile file = gitlabApi.getRepositoryFileApi().getFile(projectId, ENGAGEMENT_JSON, branch);
+            return new String(file.getDecodedContentAsBytes(), StandardCharsets.UTF_8);
+        } catch (GitLabApiException e) {
+            if(e.getHttpStatus() == 404) {
+                LOGGER.debug("Could find not legacy file {} for project {}", ENGAGEMENT_JSON, projectId);
+                return null;
+            }
+            throw new EngagementGitlabException(e.getHttpStatus(), e.getReason(), "Legacy Engagement File Not Retrieved " + projectId);
+        }
+    }
+
     public List<Engagement> getEngagements(Set<String> uuids) {
         GroupProjectsFilter filter = new GroupProjectsFilter()
                 .withIncludeSubGroups(true);
@@ -219,10 +249,11 @@ public class GitlabApiClient {
                 String content = new String(file.getDecodedContentAsBytes(), StandardCharsets.UTF_8);
                 List<Category> categories = json.fromJson(content, Category.class);
                 if(categories == null) {
-                    LOGGER.error("Category null " + e.getUuid());
+                    LOGGER.error("Category null {}", e.getUuid());
+                } else {
+                    categoryService.refresh(categories);
+                    categoryCount += categories.size();
                 }
-                categoryService.refresh(categories);
-                categoryCount += categories.size();
             } catch (GitLabApiException ex) {
                 if(ex.getHttpStatus() != 404) {
                     throw new EngagementGitlabException(ex.getHttpStatus(), ex.getReason(), "Engagement File Not Retrieved " + e.getProjectId());
@@ -331,10 +362,19 @@ public class GitlabApiClient {
                 .withJobsEnabled(false)
                 .withLfsEnabled(false)
                 .withMergeRequestsEnabled(false)
-                .withPackagesEnabled(false);
-        
+                .withPackagesEnabled(false)
+                .withTagList(List.of(lodestarTag, String.format(lodestarTagFormat, EngagementState.UPCOMING)));
+
         try {
             return gitlabApi.getProjectApi().createProject(newProject);
+        } catch (GitLabApiException e) {
+            throw new EngagementGitlabException(e.getHttpStatus(), e.getReason());
+        }
+    }
+
+    public Project updateProject(Project project) {
+        try {
+            return gitlabApi.getProjectApi().updateProject(project);
         } catch (GitLabApiException e) {
             throw new EngagementGitlabException(e.getHttpStatus(), e.getReason());
         }
@@ -350,10 +390,13 @@ public class GitlabApiClient {
     
     public void activateDeployKey(Integer projectId) {
         try {
-            DeployKey key = gitlabApi.getDeployKeysApi().enableDeployKey(projectId, deployKey);
-            gitlabApi.getDeployKeysApi().updateDeployKey(projectId , deployKey, String.format("%s %s",key.getTitle(), environment), true);
+            gitlabApi.getDeployKeysApi().enableDeployKey(projectId, deployKey);
+            gitlabApi.getDeployKeysApi().updateDeployKey(projectId , deployKey,
+                    String.format("%s %s %s",DEPLOYMENT_KEY_PREFIX, environment, DEPLOYMENT_KEY_POSTFIX), true);
         } catch (GitLabApiException e) {
-            throw new EngagementGitlabException(e.getHttpStatus(), e.getReason(), "Failed to activate deploy key for project " + projectId);
+            //A notification should be sent here. This won't error out the process, but it should reconcile
+            LOGGER.error(String.format("Failed to activate deploy key for project %d Status(%d) Reason(%s)", projectId,
+                    e.getHttpStatus(), e.getReason()));
         }
         
     }
@@ -375,9 +418,16 @@ public class GitlabApiClient {
         
         commitFiles.add(action);
 
+        String runtimeInfoContent = configService.getRuntimeConfig(engagement.getType());
+        action = new CommitAction()
+                .withAction(Action.CREATE)
+                .withFilePath(runtimeInfoFile)
+                .withContent(runtimeInfoContent);
+        commitFiles.add(action);
+
          action = new CommitAction()
                 .withAction(Action.CREATE)
-                .withFilePath("engagement.json")
+                .withFilePath(ENGAGEMENT_JSON)
                 .withContent(legacy);
 
         commitFiles.add(action);
@@ -434,6 +484,9 @@ public class GitlabApiClient {
         String engagementContent = json.toJson(engagement);
         
         String messagePrefix = engagement.getLastMessage().contains(EngagementService.LAUNCH_MESSAGE) ? LAUNCHED_MESSAGE : SUMMARY_MESSAGE;
+        if(engagement.isGitlabRetry()) {
+            messagePrefix = RETRY_MESSAGE + messagePrefix;
+        }
         String message = String.format("%s %s %s %n %s", messagePrefix, getEmoji(), getEmoji(), engagement.getLastMessage());
 
         CommitAction action = new CommitAction()
@@ -444,7 +497,7 @@ public class GitlabApiClient {
 
         action = new CommitAction()
                 .withAction(Action.UPDATE)
-                .withFilePath("engagement.json")
+                .withFilePath(ENGAGEMENT_JSON)
                 .withContent(legacy);
 
         commitActions.add(action);
