@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    if: github.repository == 'rht-labs/lodestar-engagements'
+    if: github.repository == 'mcanoy/lodestar-engagements'
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v2
